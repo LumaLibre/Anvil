@@ -1,6 +1,5 @@
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import groovy.json.JsonSlurper
 import java.net.URI
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
@@ -13,7 +12,7 @@ plugins {
 }
 
 // TODO: Configure
-group = "dev.lumas.decompile_patcher_template"
+group = "dev.lumas.templates"
 version = "0.0.0"
 
 repositories {
@@ -54,13 +53,13 @@ java {
 
 // TODO: Configure
 val decompileConfig = DecompileConfig(
-    inputJar = "sources/Decompile-Patcher-Template.jar",
+    inputJar = "sources/Template.jar",
+    vineflowerVersion = "1.11.2",
     packageMappings = mapOf(
-        "dev/lumas/decompile_patcher_template" to "."
+        "dev/lumas/templates" to "."
     ),
     resourceMappings = mapOf(
-        "plugin.yml" to ".",
-        //"config.yml" to "."
+        "plugin.yml" to "."
     )
 )
 
@@ -69,6 +68,7 @@ val decompileConfig = DecompileConfig(
 
 data class DecompileConfig(
     val inputJar: String = "sources/Decompile-Patcher-Template.jar",
+    val vineflowerVersion: String = "1.11.2",
     val decompilerDir: String = "build/decompiler",
     val generatedDir: String = "sources/generated",
     val patchesDir: String = "patches",
@@ -176,11 +176,19 @@ abstract class GitOperationsService @Inject constructor(
         }
     }
 
-    fun apply(workingDir: File, patchFile: File, verbose: Boolean = false): Pair<Int, String> {
+    fun apply(
+        workingDir: File,
+        patchFile: File,
+        verbose: Boolean = false,
+        threeWay: Boolean = false,
+        reject: Boolean = false
+    ): Pair<Int, String> {
         val errorOutput = ByteArrayOutputStream()
         val stdOutput = ByteArrayOutputStream()
         val args = mutableListOf("git", "apply")
         if (verbose) args.add("--verbose")
+        if (threeWay) args.add("--3way")
+        if (reject) args.add("--reject")
         args.add(patchFile.absolutePath)
 
         val result = execOps.exec {
@@ -191,6 +199,23 @@ abstract class GitOperationsService @Inject constructor(
             isIgnoreExitValue = true
         }
         return Pair(result.exitValue, errorOutput.toString() + stdOutput.toString())
+    }
+
+    fun hasConflictMarkers(workingDir: File): List<File> {
+        return workingDir.walkTopDown()
+            .filter { it.isFile && (it.extension == "java" || it.extension == "yml") }
+            .filter { file ->
+                try {
+                    file.readLines().any { line ->
+                        line.startsWith("<<<<<<<") ||
+                                line.startsWith("=======") ||
+                                line.startsWith(">>>>>>>")
+                    }
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            .toList()
     }
 
     fun setupRepo(workingDir: File) {
@@ -214,29 +239,43 @@ tasks.register("setupVineFlower") {
             return@doLast
         }
 
-        println("Fetching latest VineFlower release info...")
+        val pinnedVersion = decompileConfig.vineflowerVersion
+        val expectedJarName = "vineflower-$pinnedVersion.jar"
+        val vineflowerJar = decompilerDir.get().file(expectedJarName).asFile
 
-        val apiUrl = URI("https://api.github.com/repos/Vineflower/vineflower/releases/latest").toURL()
-        val json = JsonSlurper().parse(apiUrl)
+        if (vineflowerJar.exists() && vineflowerJar.length() > 0) {
+            println("✓ Vineflower $pinnedVersion already present: ${vineflowerJar.name}")
+            return@doLast
+        }
 
-        @Suppress("UNCHECKED_CAST")
-        val assets = (json as Map<String, Any>)["assets"] as List<Map<String, Any>>
-        val jarAsset = assets.firstOrNull { it["name"].toString().endsWith(".jar") }
-            ?: error("Could not find Vineflower jar in latest release")
+        // Clean out any old/stale vineflower jars so we don't ever accidentally
+        // pick up the wrong version in the decompile task.
+        decompilerDir.get().asFile.listFiles()
+            ?.filter { it.name.startsWith("vineflower-") && it.name.endsWith(".jar") }
+            ?.forEach {
+                println("🗑 Removing stale ${it.name}")
+                it.delete()
+            }
 
-        val downloadUrl = jarAsset["browser_download_url"].toString()
-        val vineflowerJar = decompilerDir.get().file(jarAsset["name"].toString()).asFile
+        val downloadUrl = "https://github.com/Vineflower/vineflower/releases/download/$pinnedVersion/vineflower-$pinnedVersion.jar"
+        println("Downloading Vineflower $pinnedVersion from $downloadUrl ...")
 
-        if (!vineflowerJar.exists()) {
-            println("Downloading Vineflower...")
+        try {
             URI(downloadUrl).toURL().openStream().use { input ->
                 Files.copy(input, vineflowerJar.toPath(), StandardCopyOption.REPLACE_EXISTING)
             }
-        } else {
-            println("Vineflower already downloaded.")
+        } catch (e: Exception) {
+            // Some releases are published with a -slim variant instead of the plain jar.
+            val slimJarName = "vineflower-$pinnedVersion-slim.jar"
+            val slimUrl = "https://github.com/Vineflower/vineflower/releases/download/$pinnedVersion/$slimJarName"
+            println("Plain jar not found, trying slim variant: $slimUrl")
+            val slimJar = decompilerDir.get().file(slimJarName).asFile
+            URI(slimUrl).toURL().openStream().use { input ->
+                Files.copy(input, slimJar.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
         }
 
-        println("Vineflower jar: ${vineflowerJar.name}")
+        println("✓ Vineflower $pinnedVersion ready")
     }
 }
 
@@ -244,12 +283,15 @@ val decompile by tasks.registering(Exec::class) {
     dependsOn("setupVineFlower")
 
     inputs.file(inputJarFile)
+    inputs.property("vineflowerVersion", decompileConfig.vineflowerVersion)
     outputs.dir(generatedOutputDir)
 
     doFirst {
+        val pinnedVersion = decompileConfig.vineflowerVersion
+        // Look for the pinned version specifically — never just "the first jar in the dir."
         val vineflowerJar = decompilerDir.get().asFile.listFiles()
-            ?.firstOrNull { it.name.endsWith(".jar") }
-            ?: error("Vineflower jar not found. Run './gradlew setupVineFlower' first.")
+            ?.firstOrNull { it.name.startsWith("vineflower-$pinnedVersion") && it.name.endsWith(".jar") }
+            ?: error("Vineflower $pinnedVersion jar not found. Run './gradlew setupVineFlower' first.")
 
         generatedOutputDir.asFile.mkdirs()
 
@@ -395,6 +437,90 @@ tasks.register("cleanGenerated") {
             println("🗑 Cleaned ${decompileConfig.generatedDir}")
         }
     }
+}
+
+// Holds the in-progress patch directory so finishPatch knows where to look
+// when a human has manually resolved conflicts.
+val conflictWorkspaceDir = project.projectDir.resolve(".patch-conflicts")
+
+// Copies the patched files from `gitDir` back into the module sources and
+// generated sources. Extracted so both applyPatch / applyAllPatches and
+// finishPatch can share the logic.
+fun copyPatchedFilesBack(gitDir: File): String {
+    val sb = StringBuilder()
+    decompileConfig.packageMappings.forEach { (packagePath, moduleTarget) ->
+        val gitSourceDir = gitDir.resolve(packagePath)
+        val moduleTargetDir = resolveModuleSrcDir(moduleTarget, packagePath) ?: return@forEach
+        val generatedTargetDir = generatedOutputDir.asFile.resolve(packagePath)
+
+        if (moduleTargetDir.exists()) moduleTargetDir.deleteRecursively()
+        if (gitSourceDir.exists()) gitSourceDir.copyRecursively(moduleTargetDir, overwrite = true)
+
+        if (generatedTargetDir.exists()) generatedTargetDir.deleteRecursively()
+        if (gitSourceDir.exists()) {
+            gitSourceDir.copyRecursively(generatedTargetDir, overwrite = true)
+            sb.appendLine("  ✓ Updated $moduleTarget (+ generated sources)")
+        } else {
+            sb.appendLine("  ✓ Updated $moduleTarget (package deleted)")
+        }
+    }
+    decompileConfig.resourceMappings.forEach { (resourceName, moduleTarget) ->
+        val gitResource = gitDir.resolve("__resources__/$resourceName")
+        val moduleResourcesDir = resolveModuleResourcesDir(moduleTarget) ?: return@forEach
+        val moduleResource = moduleResourcesDir.resolve(resourceName)
+        val generatedResource = generatedOutputDir.asFile.resolve(resourceName)
+
+        if (moduleResource.exists()) {
+            if (moduleResource.isDirectory) moduleResource.deleteRecursively()
+            else moduleResource.delete()
+        }
+        if (generatedResource.exists()) {
+            if (generatedResource.isDirectory) generatedResource.deleteRecursively()
+            else generatedResource.delete()
+        }
+
+        if (gitResource.exists()) {
+            if (gitResource.isDirectory) {
+                gitResource.copyRecursively(moduleResource, overwrite = true)
+                gitResource.copyRecursively(generatedResource, overwrite = true)
+            } else {
+                moduleResource.parentFile.mkdirs()
+                generatedResource.parentFile.mkdirs()
+                gitResource.copyTo(moduleResource, overwrite = true)
+                gitResource.copyTo(generatedResource, overwrite = true)
+            }
+            sb.appendLine("  ✓ Updated resource: $resourceName")
+        }
+    }
+    return sb.toString()
+}
+
+// Helper used by applyPatch and applyAllPatches when 3-way merge applies the
+// patch but leaves conflict markers needing human resolution.
+fun handleConflictsAndStash(gitDir: File, patchName: String, conflicts: List<File>) {
+    if (conflictWorkspaceDir.exists()) conflictWorkspaceDir.deleteRecursively()
+    gitDir.copyRecursively(conflictWorkspaceDir, overwrite = true)
+    conflictWorkspaceDir.resolve(".patch-name").writeText(patchName)
+
+    println()
+    println("⚠️  Patch applied with conflicts. Manual resolution needed.")
+    println()
+    println("Files with conflict markers:")
+    conflicts.forEach { file ->
+        println("  - ${file.relativeTo(conflictWorkspaceDir)}")
+    }
+    println()
+    println("👉 Resolve conflicts in this directory:")
+    println("   ${conflictWorkspaceDir.absolutePath}")
+    println()
+    println("   Open it in your IDE, fix the <<<<<<< / ======= / >>>>>>> markers,")
+    println("   then run:")
+    println()
+    println("   ./gradlew finishPatch")
+    println()
+    println("   To abort instead:")
+    println("   ./gradlew abortPatch")
+    println("=".repeat(60))
 }
 
 tasks.register("createPatch") {
@@ -557,6 +683,8 @@ tasks.register("applyPatch") {
         if (gitDir.exists()) gitDir.deleteRecursively()
         gitDir.mkdirs()
 
+        var keepGitDir = false
+
         try {
             gitOps.setupRepo(gitDir)
 
@@ -583,60 +711,35 @@ tasks.register("applyPatch") {
             gitOps.add(gitDir)
             gitOps.commit(gitDir, "Current state")
 
-            println("📝 Applying patch...")
-            val (exitCode, output) = gitOps.apply(gitDir, patchFile, verbose = true)
+            println("📝 Applying patch (clean)...")
+            var (exitCode, output) = gitOps.apply(gitDir, patchFile, verbose = true)
 
             if (exitCode != 0) {
-                println("❌ Failed to apply patch:")
+                println("⚠️  Clean apply failed, attempting 3-way merge...")
+                val (retryExit, retryOutput) = gitOps.apply(gitDir, patchFile, threeWay = true)
+                exitCode = retryExit
+                output = retryOutput
+
+                if (exitCode == 0) {
+                    val conflicts = gitOps.hasConflictMarkers(gitDir)
+                    if (conflicts.isNotEmpty()) {
+                        keepGitDir = true
+                        handleConflictsAndStash(gitDir, patchNameValue, conflicts)
+                        return@doLast
+                    }
+                    println("✓ Applied via 3-way merge cleanly")
+                }
+            }
+
+            if (exitCode != 0) {
+                println("❌ Failed to apply patch (both clean and 3-way):")
                 println(output)
+                println("\n💡 Try './gradlew applyPatchWithReject -PpatchName=\"$patchNameValue\"' to write .rej files")
                 return@doLast
             }
 
             println("📦 Copying patched files back to modules and generated sources...")
-            decompileConfig.packageMappings.forEach { (packagePath, moduleTarget) ->
-                val gitSourceDir = gitDir.resolve(packagePath)
-                val moduleTargetDir = resolveModuleSrcDir(moduleTarget, packagePath) ?: return@forEach
-                val generatedTargetDir = generatedOutputDir.asFile.resolve(packagePath)
-
-                if (moduleTargetDir.exists()) moduleTargetDir.deleteRecursively()
-                if (gitSourceDir.exists()) gitSourceDir.copyRecursively(moduleTargetDir, overwrite = true)
-
-                if (generatedTargetDir.exists()) generatedTargetDir.deleteRecursively()
-                if (gitSourceDir.exists()) {
-                    gitSourceDir.copyRecursively(generatedTargetDir, overwrite = true)
-                    println("  ✓ Updated $moduleTarget (+ generated sources)")
-                } else {
-                    println("  ✓ Updated $moduleTarget (package deleted)")
-                }
-            }
-            decompileConfig.resourceMappings.forEach { (resourceName, moduleTarget) -> // copy resources back
-                val gitResource = gitDir.resolve("__resources__/$resourceName")
-                val moduleResourcesDir = resolveModuleResourcesDir(moduleTarget) ?: return@forEach
-                val moduleResource = moduleResourcesDir.resolve(resourceName)
-                val generatedResource = generatedOutputDir.asFile.resolve(resourceName)
-
-                if (moduleResource.exists()) {
-                    if (moduleResource.isDirectory) moduleResource.deleteRecursively()
-                    else moduleResource.delete()
-                }
-                if (generatedResource.exists()) {
-                    if (generatedResource.isDirectory) generatedResource.deleteRecursively()
-                    else generatedResource.delete()
-                }
-
-                if (gitResource.exists()) {
-                    if (gitResource.isDirectory) {
-                        gitResource.copyRecursively(moduleResource, overwrite = true)
-                        gitResource.copyRecursively(generatedResource, overwrite = true)
-                    } else {
-                        moduleResource.parentFile.mkdirs()
-                        generatedResource.parentFile.mkdirs()
-                        gitResource.copyTo(moduleResource, overwrite = true)
-                        gitResource.copyTo(generatedResource, overwrite = true)
-                    }
-                    println("Updated resource: $resourceName")
-                }
-            }
+            println(copyPatchedFilesBack(gitDir))
 
             println("=".repeat(60))
             println("✨ Patch applied successfully!")
@@ -644,6 +747,126 @@ tasks.register("applyPatch") {
         } catch (e: Exception) {
             println("❌ Error applying patch: ${e.message}")
             e.printStackTrace()
+        } finally {
+            if (!keepGitDir) gitDir.deleteRecursively()
+        }
+    }
+}
+
+tasks.register("finishPatch") {
+    doLast {
+        if (!conflictWorkspaceDir.exists()) {
+            println("ℹ️  No in-progress patch to finish (no ${conflictWorkspaceDir.name} directory).")
+            return@doLast
+        }
+
+        val patchNameFile = conflictWorkspaceDir.resolve(".patch-name")
+        val patchName = if (patchNameFile.exists()) patchNameFile.readText().trim() else "unknown"
+
+        println("\n🔧 Finishing patch: $patchName")
+        println("=".repeat(60))
+
+        // Make sure they actually resolved everything.
+        val remaining = conflictWorkspaceDir.walkTopDown()
+            .filter { it.isFile && (it.extension == "java" || it.extension == "yml") }
+            .filter { file ->
+                try {
+                    file.readLines().any { line ->
+                        line.startsWith("<<<<<<<") ||
+                                line.startsWith("=======") ||
+                                line.startsWith(">>>>>>>")
+                    }
+                } catch (e: Exception) { false }
+            }
+            .toList()
+
+        if (remaining.isNotEmpty()) {
+            println("❌ Conflict markers still present in:")
+            remaining.forEach { println("  - ${it.relativeTo(conflictWorkspaceDir)}") }
+            println("\nResolve all <<<<<<< / ======= / >>>>>>> markers and run again.")
+            return@doLast
+        }
+
+        // Drop the marker file so it doesn't sneak into the source tree.
+        patchNameFile.delete()
+
+        println("📦 Copying resolved files back to modules and generated sources...")
+        println(copyPatchedFilesBack(conflictWorkspaceDir))
+
+        conflictWorkspaceDir.deleteRecursively()
+
+        println("=".repeat(60))
+        println("✨ Patch '$patchName' finalized.")
+        println("💡 Consider running:")
+        println("   ./gradlew createPatch -PpatchName=\"$patchName\"")
+        println("   to refresh the patch file against the new decompile baseline.")
+    }
+}
+
+tasks.register("abortPatch") {
+    doLast {
+        if (!conflictWorkspaceDir.exists()) {
+            println("ℹ️  No in-progress patch to abort.")
+            return@doLast
+        }
+        conflictWorkspaceDir.deleteRecursively()
+        println("🗑 Aborted in-progress patch and cleaned ${conflictWorkspaceDir.name}.")
+    }
+}
+
+tasks.register("applyPatchWithReject") {
+    usesService(gitOpsService)
+
+    doLast {
+        val patchNameValue = project.findProperty("patchName") as String?
+            ?: throw GradleException("Please specify patch name: -PpatchName=\"name\"")
+
+        val gitOps = gitOpsService.get()
+        val patchFile = patchesDirPath.asFile.resolve("$patchNameValue.patch")
+        if (!patchFile.exists()) {
+            println("❌ Patch not found: $patchNameValue.patch")
+            return@doLast
+        }
+
+        val gitDir = project.projectDir.resolve(".patch-git")
+        if (gitDir.exists()) gitDir.deleteRecursively()
+        gitDir.mkdirs()
+
+        try {
+            gitOps.setupRepo(gitDir)
+
+            decompileConfig.packageMappings.forEach { (packagePath, moduleTarget) ->
+                val moduleSrcDir = resolveModuleSrcDir(moduleTarget, packagePath) ?: return@forEach
+                if (moduleSrcDir.exists()) {
+                    moduleSrcDir.copyRecursively(gitDir.resolve(packagePath), overwrite = true)
+                }
+            }
+
+            gitOps.add(gitDir)
+            gitOps.commit(gitDir, "Current state")
+
+            val (exitCode, output) = gitOps.apply(gitDir, patchFile, reject = true)
+
+            // --reject returns non-zero whenever any hunk fails, but it does
+            // write the successful hunks and leave .rej files for the rest.
+            val rejFiles = gitDir.walkTopDown().filter { it.name.endsWith(".rej") }.toList()
+
+            // Stage the half-applied result so the user can poke at it.
+            if (conflictWorkspaceDir.exists()) conflictWorkspaceDir.deleteRecursively()
+            gitDir.copyRecursively(conflictWorkspaceDir, overwrite = true)
+            conflictWorkspaceDir.resolve(".patch-name").writeText(patchNameValue)
+
+            println("Apply exited with $exitCode")
+            println(output)
+            if (rejFiles.isNotEmpty()) {
+                println("\nRejected hunks written to:")
+                rejFiles.forEach { println("  - ${it.relativeTo(gitDir)}") }
+            }
+            println("\n👉 Inspect / fix up the partial state here:")
+            println("   ${conflictWorkspaceDir.absolutePath}")
+            println("\nWhen done: ./gradlew finishPatch")
+            println("To abort:  ./gradlew abortPatch")
+
         } finally {
             gitDir.deleteRecursively()
         }
@@ -662,22 +885,39 @@ tasks.register("applyAllPatches") {
             return@doLast
         }
 
+        if (conflictWorkspaceDir.exists()) {
+            println("⚠️  An in-progress patch is already pending resolution:")
+            println("    ${conflictWorkspaceDir.absolutePath}")
+            println("    Run './gradlew finishPatch' or './gradlew abortPatch' first.")
+            return@doLast
+        }
+
         println("\n🔧 Applying all patches...")
         println("=".repeat(60))
 
         var successCount = 0
         var failedCount = 0
+        var threeWayCount = 0
         val failedPatches = mutableListOf<String>()
+
+        // Pause and let the user resolve if a 3-way merge leaves conflicts.
+        // We return early from the loop in that case so we don't trample state
+        // by trying later patches against a half-resolved tree.
+        var stoppedForConflict = false
 
         patchesDirFile.listFiles()
             ?.filter { it.extension == "patch" }
             ?.sortedBy { it.name }
-            ?.forEach { patchFile ->
+            ?.forEach inner@{ patchFile ->
+                if (stoppedForConflict) return@inner
+
                 println("\n📄 Applying: ${patchFile.nameWithoutExtension}")
 
                 val gitDir = project.projectDir.resolve(".patch-git")
                 if (gitDir.exists()) gitDir.deleteRecursively()
                 gitDir.mkdirs()
+
+                var keepGitDir = false
 
                 try {
                     gitOps.setupRepo(gitDir)
@@ -706,52 +946,37 @@ tasks.register("applyAllPatches") {
                     gitOps.add(gitDir)
                     gitOps.commit(gitDir, "Current state")
 
-                    val (exitCode, errorMsg) = gitOps.apply(gitDir, patchFile)
+                    // Try clean apply first.
+                    var (exitCode, errorMsg) = gitOps.apply(gitDir, patchFile)
+
+                    if (exitCode != 0) {
+                        // Fall back to 3-way. Small drift in surrounding lines
+                        // no longer kills the patch.
+                        val (retryExit, retryOut) = gitOps.apply(gitDir, patchFile, threeWay = true)
+                        exitCode = retryExit
+                        errorMsg = retryOut
+
+                        if (exitCode == 0) {
+                            val conflicts = gitOps.hasConflictMarkers(gitDir)
+                            if (conflicts.isNotEmpty()) {
+                                // 3-way produced conflict markers — stop everything
+                                // and hand off to the human.
+                                keepGitDir = true
+                                stoppedForConflict = true
+                                handleConflictsAndStash(gitDir, patchFile.nameWithoutExtension, conflicts)
+                                return@inner
+                            }
+                            println("  ⚠️  Applied via 3-way (no conflicts)")
+                            threeWayCount++
+                        }
+                    }
 
                     if (exitCode != 0) {
                         println("  ❌ Failed: ${errorMsg.take(200)}")
                         failedPatches.add(patchFile.nameWithoutExtension)
                         failedCount++
                     } else {
-                        decompileConfig.packageMappings.forEach { (packagePath, moduleTarget) ->
-                            val gitSourceDir = gitDir.resolve(packagePath)
-                            val moduleTargetDir = resolveModuleSrcDir(moduleTarget, packagePath) ?: return@forEach
-                            val generatedTargetDir = generatedOutputDir.asFile.resolve(packagePath)
-
-                            if (moduleTargetDir.exists()) moduleTargetDir.deleteRecursively()
-                            if (gitSourceDir.exists()) gitSourceDir.copyRecursively(moduleTargetDir, overwrite = true)
-
-                            if (generatedTargetDir.exists()) generatedTargetDir.deleteRecursively()
-                            if (gitSourceDir.exists()) gitSourceDir.copyRecursively(generatedTargetDir, overwrite = true)
-                        }
-                        decompileConfig.resourceMappings.forEach { (resourceName, moduleTarget) ->
-                            val gitResource = gitDir.resolve("__resources__/$resourceName")
-                            val moduleResourcesDir = resolveModuleResourcesDir(moduleTarget) ?: return@forEach
-                            val moduleResource = moduleResourcesDir.resolve(resourceName)
-                            val generatedResource = generatedOutputDir.asFile.resolve(resourceName)
-
-                            if (moduleResource.exists()) {
-                                if (moduleResource.isDirectory) moduleResource.deleteRecursively()
-                                else moduleResource.delete()
-                            }
-                            if (generatedResource.exists()) {
-                                if (generatedResource.isDirectory) generatedResource.deleteRecursively()
-                                else generatedResource.delete()
-                            }
-
-                            if (gitResource.exists()) {
-                                if (gitResource.isDirectory) {
-                                    gitResource.copyRecursively(moduleResource, overwrite = true)
-                                    gitResource.copyRecursively(generatedResource, overwrite = true)
-                                } else {
-                                    moduleResource.parentFile.mkdirs()
-                                    generatedResource.parentFile.mkdirs()
-                                    gitResource.copyTo(moduleResource, overwrite = true)
-                                    gitResource.copyTo(generatedResource, overwrite = true)
-                                }
-                            }
-                        }
-
+                        copyPatchedFilesBack(gitDir)
                         println("  ✓ Success (+ updated generated sources)")
                         successCount++
                     }
@@ -760,17 +985,108 @@ tasks.register("applyAllPatches") {
                     failedPatches.add(patchFile.nameWithoutExtension)
                     failedCount++
                 } finally {
-                    gitDir.deleteRecursively()
+                    if (!keepGitDir) gitDir.deleteRecursively()
                 }
             }
 
         println("\n" + "=".repeat(60))
-        println("✨ Applied: $successCount | Failed: $failedCount")
+        println("✨ Clean: ${successCount - threeWayCount} | 3-way: $threeWayCount | Failed: $failedCount")
 
         if (failedPatches.isNotEmpty()) {
-            println("\n❌ Failed patches:")
+            println("\n❌ Failed patches (couldn't apply even with 3-way merge):")
             failedPatches.forEach { println("  - $it") }
+            println("\n💡 Try './gradlew applyPatchWithReject -PpatchName=\"<name>\"' to see")
+            println("   exactly which hunks failed, then resolve manually.")
         }
+
+        if (stoppedForConflict) {
+            println("\n⏸  Stopped — resolve the in-progress patch before running this again.")
+        } else if (threeWayCount > 0) {
+            println("\n💡 Some patches applied via 3-way merge. Consider regenerating them:")
+            println("   for each patch: ./gradlew createPatch -PpatchName=\"<name>\"")
+            println("   This refreshes the patch against the current decompile baseline,")
+            println("   so future runs apply cleanly.")
+        }
+    }
+}
+
+tasks.register("syncSourceToGenerated") {
+    group = "patching"
+    description = "Copies module source (and resources) back into generated sources so the current state becomes the new patching baseline. Useful after manually resolving patches in your IDE."
+
+    doLast {
+        println("\n🔄 Syncing module sources -> generated baseline...")
+        println("=".repeat(60))
+
+        var fileCount = 0
+        var resourceCount = 0
+
+        decompileConfig.packageMappings.forEach { (packagePath, moduleTarget) ->
+            val moduleSrcDir = resolveModuleSrcDir(moduleTarget, packagePath)
+            val generatedTargetDir = generatedOutputDir.asFile.resolve(packagePath)
+
+            if (moduleSrcDir == null || !moduleSrcDir.exists()) {
+                // Module side is gone — wipe the generated copy to match.
+                if (generatedTargetDir.exists()) {
+                    generatedTargetDir.deleteRecursively()
+                    println("🗑  Removed from generated (no module source): $packagePath")
+                }
+                return@forEach
+            }
+
+            // Wipe and re-copy so deletions in the module are reflected.
+            if (generatedTargetDir.exists()) generatedTargetDir.deleteRecursively()
+            generatedTargetDir.mkdirs()
+
+            var copied = 0
+            moduleSrcDir.walkTopDown().forEach { sourceFile ->
+                if (sourceFile.isFile && sourceFile.extension == "java") {
+                    val relativePath = sourceFile.relativeTo(moduleSrcDir)
+                    val targetFile = generatedTargetDir.resolve(relativePath)
+                    targetFile.parentFile.mkdirs()
+                    sourceFile.copyTo(targetFile, overwrite = true)
+                    copied++
+                }
+            }
+            fileCount += copied
+            println("📦 $moduleTarget/$packagePath -> generated/$packagePath ($copied files)")
+        }
+
+        decompileConfig.resourceMappings.forEach { (resourceName, moduleTarget) ->
+            val moduleResourcesDir = resolveModuleResourcesDir(moduleTarget) ?: return@forEach
+            val moduleResource = moduleResourcesDir.resolve(resourceName)
+            val generatedResource = generatedOutputDir.asFile.resolve(resourceName)
+
+            if (generatedResource.exists()) {
+                if (generatedResource.isDirectory) generatedResource.deleteRecursively()
+                else generatedResource.delete()
+            }
+
+            if (!moduleResource.exists()) {
+                println("🗑  Removed resource from generated (no module copy): $resourceName")
+                return@forEach
+            }
+
+            if (moduleResource.isDirectory) {
+                moduleResource.copyRecursively(generatedResource, overwrite = true)
+                val count = moduleResource.walkTopDown().count { it.isFile }
+                resourceCount += count
+                println("📋 Resource dir: $resourceName ($count files)")
+            } else {
+                generatedResource.parentFile.mkdirs()
+                moduleResource.copyTo(generatedResource, overwrite = true)
+                resourceCount++
+                println("📋 Resource file: $resourceName")
+            }
+        }
+
+        println("\n" + "=".repeat(60))
+        println("✓ Synced $fileCount java files and $resourceCount resource files.")
+        println()
+        println("💡 The generated baseline now matches your current module sources.")
+        println("   './gradlew patchStatus' should report no modifications.")
+        println("   You can now make new edits and './gradlew createPatch -PpatchName=\"...\"'")
+        println("   will diff against this state.")
     }
 }
 
