@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Quick patcher script
+# Quick patcher script (Paper-style per-file patches)
 # Usage: ./patcher.sh <command> <args?>
 
 set -e
@@ -15,100 +15,57 @@ else
     exit 1
 fi
 
-# Check for an in-progress conflict resolution before destructive ops.
-warn_if_in_progress() {
-    if [ -d ".patch-conflicts" ]; then
-        echo "⚠️  A patch is currently mid-resolution in .patch-conflicts/"
-        echo "    Finish it with './patcher.sh finish' or abort with './patcher.sh abort' first."
-        exit 1
-    fi
-}
-
 case "$1" in
-    init)
-        warn_if_in_progress
-        echo "=== Initializing ==="
-        $GRADLE decompileAndApplyPatches
+    setup|init)
+        # Decompile (if needed) + distribute base + apply all file patches.
+        echo "=== Setup ==="
+        $GRADLE setup
         echo "Done!"
         ;;
 
     fresh)
-        warn_if_in_progress
         echo "=== Fresh Start ==="
-        echo "This will wipe everything and decompile all over again."
+        echo "This wipes module sources + the decompiled base and rebuilds from scratch."
         read -p "Continue? [y/N] " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            $GRADLE cleanDistributedSources cleanGenerated
-            $GRADLE decompileAndApplyPatches
+            $GRADLE cleanDistributedSources cleanGenerated cleanCache
+            $GRADLE setup
             echo "Finished!"
         fi
         ;;
 
     status|s)
+        # Which module files differ from the pristine base.
         $GRADLE patchStatus
         ;;
 
-    create|c)
-        warn_if_in_progress
-        if [ -z "$2" ]; then
-            read -p "Patch name: " name
-        else
-            name="$2"
-        fi
-        $GRADLE createPatch -PpatchName="$name"
-        ;;
-
     apply|a)
-        warn_if_in_progress
-        if [ -z "$2" ]; then
-            $GRADLE listPatches
-            echo ""
-            read -p "Patch name: " name
-        else
-            name="$2"
-        fi
-        $GRADLE applyPatch -PpatchName="$name"
+        # Reconstruct the working tree: base + every file patch.
+        $GRADLE applyPatches
         ;;
 
-    apply-all|aa)
-        warn_if_in_progress
-        $GRADLE applyAllPatches
+    apply-only)
+        # Overlay patches onto whatever is already in the modules (no re-distribute).
+        $GRADLE applyFilePatches
         ;;
 
-    apply-reject|ar)
-        # Last-resort apply: writes successful hunks and leaves .rej files
-        # for failing hunks in .patch-conflicts/.
-        warn_if_in_progress
-        if [ -z "$2" ]; then
-            $GRADLE listPatches
-            echo ""
-            read -p "Patch name: " name
-        else
-            name="$2"
-        fi
-        $GRADLE applyPatchWithReject -PpatchName="$name"
+    apply-fuzzy|af)
+        # Same as apply but adds a fuzzy `patch` rung before rejecting hunks.
+        $GRADLE applyFilePatchesFuzzy
         ;;
 
-    finish|f)
-        # Used after manually resolving conflicts in .patch-conflicts/.
-        $GRADLE finishPatch
+    rebuild|r)
+        # Regenerate per-file patches from your current module edits.
+        # This is also how you "finish" a conflict: fix the files, then rebuild.
+        $GRADLE rebuildFilePatches
         ;;
 
-    abort)
-        # Throw away whatever's in .patch-conflicts/ without applying.
-        $GRADLE abortPatch
-        ;;
-
-    sync)
-        # Copy current module sources back over the generated baseline so
-        # the next createPatch only diffs *new* changes. Run this after
-        # finishing patches manually (in your IDE) outside the patcher.
-        warn_if_in_progress
-        echo "This will overwrite your decompiled baseline with the current module source."
-        echo "Use this after manually applying patches in your IDE."
+    reset)
+        # Throw away manual module edits, rebuild working tree from base + patches.
+        echo "This discards uncommitted edits in the module sources."
         read -p "Continue? [y/N] " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            $GRADLE syncSourceToGenerated
+            $GRADLE resetSources
         fi
         ;;
 
@@ -121,60 +78,52 @@ case "$1" in
         ;;
 
     clean)
-        warn_if_in_progress
         echo "Clean options:"
         echo "  1) Module sources"
-        echo "  2) Generated/decompiled"
-        echo "  3) Both"
+        echo "  2) Generated/decompiled base"
+        echo "  3) Patch work dirs (.patch-work / .patch-rejects)"
+        echo "  4) All"
         read -p "Choice: " choice
         case $choice in
             1) $GRADLE cleanDistributedSources ;;
             2) $GRADLE cleanGenerated ;;
-            3) $GRADLE cleanDistributedSources cleanGenerated ;;
+            3) $GRADLE cleanCache ;;
+            4) $GRADLE cleanDistributedSources cleanGenerated cleanCache ;;
         esac
-        ;;
-
-    save)
-        warn_if_in_progress
-        $GRADLE patchStatus
-        echo ""
-        read -p "Patch name (or blank to cancel): " name
-        if [ -n "$name" ]; then
-            $GRADLE createPatch -PpatchName="$name"
-        fi
         ;;
 
     *)
         echo "Patcher commands:"
         echo ""
-        echo "  init         - First time setup (decompile + distribute + patches)"
-        echo "  fresh        - Wipe and start over"
+        echo "  setup, init      - Decompile + distribute base + apply all file patches"
+        echo "  fresh            - Wipe everything and rebuild from scratch"
         echo ""
-        echo "  status, s    - Check what's been changed and what you can save as a new patch"
-        echo "  save         - Check status then save as patch"
-        echo "  create, c    - Create a patch from current modifications"
-        echo "  apply, a     - Apply a single patch (3-way merge fallback)"
-        echo "  apply-all,aa - Apply every patch in order"
-        echo "  apply-reject,ar - Apply with --reject, leaves .rej files for failed hunks"
-        echo "  list, l      - List patches"
+        echo "  status, s        - Show which module files differ from the base"
+        echo "  apply, a         - Reconstruct module sources = base + all patches"
+        echo "  apply-fuzzy, af  - apply with an extra fuzzy matching rung"
+        echo "  apply-only       - Overlay patches without re-distributing the base"
+        echo "  rebuild, r       - Regenerate per-file patches from current module edits"
+        echo "  reset            - Discard module edits; rebuild tree from base + patches"
+        echo "  list, l          - List the per-file patches"
         echo ""
-        echo "  finish, f    - Finalize an in-progress patch after resolving conflicts in your IDE"
-        echo "  abort        - Throw away an in-progress patch resolution"
-        echo "  sync         - Snapshot current module source as the new decompile baseline"
+        echo "  inspect, i       - Show decompiled structure"
+        echo "  clean            - Clean up sources / base / work dirs"
         echo ""
-        echo "  inspect, i   - Show decompiled structure"
-        echo "  clean        - Clean up sources"
+        echo "Conflict workflow (one patch per file, so failures are isolated):"
+        echo "  1) './patcher.sh apply' reports files needing attention"
+        echo "       - conflict markers are left directly in the module file"
+        echo "       - rejected hunks are written to .patch-rejects/<path>.rej"
+        echo "  2) Fix those files in your IDE"
+        echo "  3) './patcher.sh rebuild' regenerates clean patches from your fixes"
         echo ""
-        echo "Workflow on a conflict:"
-        echo "  1) './patcher.sh apply 003-foo' fails with conflict markers"
-        echo "  2) Open .patch-conflicts/ in your IDE, fix <<<<<<< / ======= / >>>>>>>"
-        echo "  3) './patcher.sh finish' to copy resolved files back"
-        echo "  4) Optionally './patcher.sh create 003-foo' to refresh the patch file"
+        echo "Edit / add code:"
+        echo "  1) Edit files in the module src tree (or add new ones)"
+        echo "  2) './patcher.sh status' to see what changed"
+        echo "  3) './patcher.sh rebuild' to update the patch tree"
         echo ""
         echo "Examples:"
-        echo "  ./patcher.sh init"
+        echo "  ./patcher.sh setup"
         echo "  ./patcher.sh status"
-        echo "  ./patcher.sh create 000-my-patch"
-        echo "  ./patcher.sh save"
+        echo "  ./patcher.sh rebuild"
         ;;
 esac
