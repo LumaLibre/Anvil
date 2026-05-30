@@ -53,7 +53,7 @@ java {
 // TODO: Configure
 val decompileConfig = DecompileConfig(
     inputJar = "sources/Template.jar",
-    vineflowerVersion = "1.11.2",
+    vineflowerVersion = "1.12.0",
     packageMappings = mapOf(
         "dev/lumas/templates" to "."
     ),
@@ -63,8 +63,8 @@ val decompileConfig = DecompileConfig(
 )
 
 data class DecompileConfig(
-    val inputJar: String = "sources/Decompile-Patcher-Template.jar",
-    val vineflowerVersion: String = "1.11.2",
+    val inputJar: String = "sources/Template.jar",
+    val vineflowerVersion: String = "1.12.0",
     val decompilerDir: String = "build/decompiler",
     val generatedDir: String = "sources/generated",
     val patchesDir: String = "patches",
@@ -683,30 +683,47 @@ tasks.register("rebuildFilePatches") {
         val changed = gitOps.changedPaths(scratch)
         val patchesRoot = patchesDirPath.asFile
 
-        if (changed.isEmpty()) {
-            println("ℹ️  No differences between module sources and base.")
-        } else {
-            changed.forEach { canonical ->
-                val patchFile = patchesRoot.resolve("$canonical.patch")
-                gitOps.writeFileDiff(scratch, canonical, patchFile)
-                println("  ✓ $canonical.patch")
+        val tmp = scratch.resolve(".rebuild.tmp")
+        var created = 0
+        var updated = 0
+        var unchanged = 0
+
+        changed.forEach { canonical ->
+            gitOps.writeFileDiff(scratch, canonical, tmp)
+            val fresh = if (tmp.exists()) tmp.readBytes() else ByteArray(0)
+            val patchFile = patchesRoot.resolve("$canonical.patch")
+            when {
+                !patchFile.exists() -> {
+                    patchFile.parentFile.mkdirs()
+                    tmp.copyTo(patchFile, overwrite = true)
+                    println("  ➕ created:  $canonical.patch")
+                    created++
+                }
+                !patchFile.readBytes().contentEquals(fresh) -> {
+                    tmp.copyTo(patchFile, overwrite = true)
+                    println("  ✏️  updated:  $canonical.patch")
+                    updated++
+                }
+                else -> unchanged++ // identical diff — leave the file untouched
             }
         }
 
         // Prune patches whose file no longer differs from base.
         val changedSet = changed.toSet()
+        var removed = 0
         allPatchFiles().forEach { patch ->
             val canonical = patchCanonical(patch)
             if (canonical !in changedSet) {
                 patch.delete()
-                println("  🗑 stale: $canonical.patch")
+                println("  🗑 removed:  $canonical.patch")
+                removed++
             }
         }
         pruneEmptyDirs(patchesRoot)
         patchWorkDir.deleteRecursively()
 
         println("\n" + "=".repeat(60))
-        println("✨ Rebuilt ${changed.size} patch(es).")
+        println("✨ $created created, $updated updated, $removed removed  ($unchanged unchanged)")
     }
 }
 
@@ -733,43 +750,69 @@ tasks.register("listPatches") {
 
 tasks.register("patchStatus") {
     group = "patching"
-    description = "Shows which module files differ from the pristine base (i.e. what rebuildFilePatches would capture)."
+    description = "Shows whether the patch tree is in sync with the module sources (i.e. what rebuildFilePatches would change)."
+    usesService(gitOpsService)
     dependsOn(decompile)
     doLast {
-        println("\n📊 Patch status (module sources vs pristine base)")
+        val gitOps = gitOpsService.get()
+        println("\n📊 Patch status (patch tree vs module sources)")
         println("=".repeat(60))
 
-        var modified = 0
-        var added = 0
-        var deleted = 0
+        // Reproduce exactly what rebuildFilePatches would compute, but write nothing.
+        val scratch = freshScratch()
+        gitOps.setupRepo(scratch)
+        layoutBaseInto(scratch)
+        gitOps.add(scratch)
+        gitOps.commit(scratch, "Pristine decompiled base")
 
-        enumerateEntries().forEach { entry ->
-            val baseExists = entry.base.exists() && entry.base.isFile
-            val workExists = entry.working.exists() && entry.working.isFile
+        layoutWorkingInto(scratch)
+        gitOps.add(scratch)
+
+        val changed = gitOps.changedPaths(scratch)
+        val changedSet = changed.toSet()
+        val tmp = scratch.resolve(".status.tmp")
+
+        var newCount = 0
+        var updated = 0
+        var tracked = 0
+        var stale = 0
+
+        // For each file that differs from base, compare the diff rebuild *would*
+        // write against the patch currently on disk.
+        changed.forEach { canonical ->
+            gitOps.writeFileDiff(scratch, canonical, tmp)
+            val freshDiff = if (tmp.exists()) tmp.readBytes() else ByteArray(0)
+            val existing = patchesDirPath.asFile.resolve("$canonical.patch")
             when {
-                baseExists && workExists -> {
-                    if (entry.base.readText() != entry.working.readText()) {
-                        println("  ✏️  modified: ${entry.canonical}")
-                        modified++
-                    }
+                !existing.exists() -> {
+                    println("  ➕ new patch:    $canonical")
+                    newCount++
                 }
-                !baseExists && workExists -> {
-                    println("  ➕ new:      ${entry.canonical}")
-                    added++
+                !existing.readBytes().contentEquals(freshDiff) -> {
+                    println("  ✏️  updated:      $canonical")
+                    updated++
                 }
-                baseExists && !workExists -> {
-                    println("  🗑️  deleted:  ${entry.canonical}")
-                    deleted++
-                }
+                else -> tracked++
             }
         }
 
+        // Patches whose file no longer differs from base would be pruned.
+        allPatchFiles().forEach { patch ->
+            val canonical = patchCanonical(patch)
+            if (canonical !in changedSet) {
+                println("  🗑️  stale:        $canonical (would be removed)")
+                stale++
+            }
+        }
+
+        patchWorkDir.deleteRecursively()
+
         println("\n" + "=".repeat(60))
-        println("Summary: $modified modified, $added new, $deleted deleted")
-        if (modified + added + deleted > 0) {
-            println("\n💡 Run './gradlew rebuildFilePatches' to capture these into the patch tree.")
+        println("Summary: $newCount new, $updated updated, $stale stale  ($tracked already in sync)")
+        if (newCount + updated + stale > 0) {
+            println("\n💡 Run './gradlew rebuildFilePatches' to sync the patch tree.")
         } else {
-            println("\nℹ️  Working tree matches base — patches are up to date.")
+            println("\nℹ️  Patch tree is in sync — rebuildFilePatches would make no changes.")
         }
     }
 }
