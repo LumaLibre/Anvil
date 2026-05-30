@@ -20,6 +20,7 @@ sources/*.jar
 # Decompiler downloads
 build/decompiler/
 
+!patches/**/*.patch
 
 # Source code
 api/
