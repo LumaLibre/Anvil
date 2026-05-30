@@ -1,1 +1,1 @@
-rootProject.name = "Decompile-Patcher-Template" // TODO: Configure
+rootProject.name = "Anvil" // TODO: Configure
